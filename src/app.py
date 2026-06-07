@@ -12,12 +12,15 @@ Flask 主入口
 6. 后续可通过 API 将数据库中的投稿同步到 Halo 博客
 """
 
+import secrets          # 生成安全的登录 token（不可预测的随机字符串）
 import logging
 from datetime import datetime
-from flask import Flask, request, jsonify
+from functools import wraps  # wraps 用于保持装饰器函数的元信息（函数名、文档等）
+import os
+from flask import Flask, request, jsonify, send_from_directory
 from src.config import config
-from src.services.tduck_client import TduckClient
-from src.services.halo_client import HaloClient
+from src.services.tduck_client import TduckClient  # tduck 表单平台客户端
+from src.services.halo_client import HaloClient    # Halo 博客客户端
 from src.utils.logger import setup_logger
 from src.database import init_db, get_session, close_db
 from src.models import Post
@@ -49,6 +52,103 @@ def create_app() -> Flask:
     if not halo_enabled:
         logger.info("Halo 同步已禁用（config.json 中 halo.enabled = false）")
 
+    # ===== 鉴权基础设施 =====
+    # token 存在内存中，服务重启后所有登录失效（需重新登录）
+    # 如需持久化登录可改为 JWT 或数据库存储
+    _admin_token = None
+
+    def require_auth(f):
+        """登录鉴权装饰器：检查请求头 Authorization: Bearer <token>"""
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            token = None
+            auth_header = request.headers.get("Authorization")
+            if auth_header and auth_header.startswith("Bearer "):
+                token = auth_header.split(" ", 1)[1]  # 提取 "Bearer xxx" 中的 xxx
+            if token and token == _admin_token:
+                return f(*args, **kwargs)
+            return jsonify({"error": "未登录或登录已过期"}), 401
+        return decorated
+
+    # ==== 登录 ====
+    @app.route("/api/login", methods=["POST"])
+    def login():
+        """管理员登录：验证密码后返回 token（密码从 config.json 的 admin.password 读取）"""
+        data = request.get_json(silent=True) or {}
+        admin_password = config.admin.get("password", "")
+        if data.get("password") == admin_password:
+            nonlocal _admin_token
+            _admin_token = secrets.token_hex(16)  # 生成 32 位随机 token
+            logger.info("管理员登录成功")
+            return jsonify({"token": _admin_token}), 200
+        logger.warning("管理员登录失败：密码错误")
+        return jsonify({"error": "密码错误"}), 401
+
+    # ==== 统计 ====
+    @app.route("/api/stats", methods=["GET"])
+    @require_auth
+    def get_stats():
+        """获取各状态投稿数量，供仪表盘展示"""
+        try:
+            session = get_session()
+            counts = {}
+            for s in ["pending_review", "pending", "synced", "rejected"]:
+                counts[s] = session.query(Post).filter(Post.status == s).count()
+            return jsonify({"status": "success", "stats": counts}), 200
+        except Exception as e:
+            logger.error(f"获取统计失败: {str(e)}", exc_info=True)
+            return jsonify({"error": str(e)}), 500
+
+    # ==== 审核通过 ====
+    @app.route("/api/posts/<int:post_id>/approve", methods=["POST"])
+    @require_auth
+    def approve_post(post_id: int):
+        """审核通过：pending_review → pending（只有待审核状态才能通过）"""
+        try:
+            session = get_session()
+            post = session.query(Post).filter(Post.id == post_id).first()
+            if not post:
+                return jsonify({"error": "投稿不存在"}), 404
+            if post.status != "pending_review":
+                return jsonify({"error": f"当前状态为 {post.status}，不可审核通过"}), 400
+            post.status = "pending"  # 变为待同步状态
+            session.commit()
+            logger.info(f"投稿 {post_id} 已审核通过 → pending")
+            return jsonify({"status": "success", "post": post.to_dict()}), 200
+        except Exception as e:
+            logger.error(f"审核通过失败: {str(e)}", exc_info=True)
+            return jsonify({"error": str(e)}), 500
+
+    # ==== 批量操作 ====
+    @app.route("/api/posts/batch", methods=["POST"])
+    @require_auth
+    def batch_action():
+        """批量通过/拒绝：请求体 { ids: [1,2,3], action: "approve"|"reject" }"""
+        try:
+            body = request.get_json(silent=True) or {}
+            ids = body.get("ids", [])
+            action = body.get("action")
+            if not ids or action not in ("approve", "reject"):
+                return jsonify({"error": "请提供 ids 和 action（approve/reject）"}), 400
+            session = get_session()
+            posts = session.query(Post).filter(Post.id.in_(ids)).all()
+            new_status = "pending" if action == "approve" else "rejected"
+            for post in posts:
+                # 批量通过时只处理 pending_review 状态的投稿
+                if action == "approve" and post.status != "pending_review":
+                    continue
+                post.status = new_status
+            session.commit()
+            logger.info(f"批量{action}完成，涉及 {len(posts)} 条投稿")
+            return jsonify({
+                "status": "success",
+                "message": f"已{action} {len(posts)} 条投稿",
+                "affected": len(posts)
+            }), 200
+        except Exception as e:
+            logger.error(f"批量操作失败: {str(e)}", exc_info=True)
+            return jsonify({"error": str(e)}), 500
+
     @app.route("/health", methods=["GET"])
     def health_check():
         """健康检查接口，供运维监控系统调用"""
@@ -64,7 +164,7 @@ def create_app() -> Flask:
         2. 解析表单数据（hooks/questionnaire_parser.py）
         3. 敏感词过滤（hooks/content_filter.py）
         4. AI审核（hooks/ai_review.py，可选）
-        5. 存入数据库（状态为 pending）
+        5. 存入数据库（状态为 pending_review）
 
         tduck Webhook 配置：
         - URL: http://your-server:5000/webhook/tduck
@@ -114,6 +214,8 @@ def create_app() -> Flask:
                         "reason": review_result["reason"]
                     }), 200
 
+            # 存入数据库，状态为 pending_review（待审核）
+            # 后续流程：pending_review →（审核通过）→ pending →（同步Halo）→ synced
             session = get_session()
             post = Post(
                 title=filtered_data["title"],
@@ -126,7 +228,7 @@ def create_app() -> Flask:
                 submit_address=filtered_data.get("submit_address"),
                 submit_time=filtered_data.get("submit_time"),
                 tags=filtered_data.get("tags", []),
-                status="pending",
+                status="pending_review",  # 改为待审核，不再是直接 pending
                 tduck_id=filtered_data.get("tduck_id"),
                 tduck_serial=filtered_data.get("tduck_serial"),
                 raw_data=filtered_data.get("raw_data"),
@@ -134,7 +236,7 @@ def create_app() -> Flask:
             session.add(post)
             session.commit()
 
-            logger.info(f"投稿已存入数据库，ID: {post.id}, 作者: {post.user_name}")
+            logger.info(f"投稿已存入数据库（待审核），ID: {post.id}, 作者: {post.user_name}")
             return jsonify({
                 "status": "success",
                 "message": "投稿已存入数据库",
@@ -152,6 +254,7 @@ def create_app() -> Flask:
             return jsonify({"error": f"服务器内部错误: {str(e)}"}), 500
 
     @app.route("/api/posts", methods=["GET"])
+    @require_auth
     def list_posts():
         """
         获取投稿列表
@@ -188,6 +291,7 @@ def create_app() -> Flask:
             return jsonify({"error": str(e)}), 500
 
     @app.route("/api/posts/<int:post_id>", methods=["GET"])
+    @require_auth
     def get_post(post_id: int):
         """获取单条投稿详情"""
         try:
@@ -207,6 +311,7 @@ def create_app() -> Flask:
             return jsonify({"error": str(e)}), 500
 
     @app.route("/api/posts/<int:post_id>/reject", methods=["POST"])
+    @require_auth
     def reject_post(post_id: int):
         """拒绝投稿（标记为 rejected）"""
         try:
@@ -231,6 +336,7 @@ def create_app() -> Flask:
             return jsonify({"error": str(e)}), 500
 
     @app.route("/api/posts/sync-to-halo", methods=["POST"])
+    @require_auth
     def sync_to_halo():
         """
         将待同步的投稿同步到 Halo 博客
@@ -367,6 +473,7 @@ def create_app() -> Flask:
             raise
 
     @app.route("/api/tduck/sync", methods=["POST"])
+    @require_auth
     def sync_tduck_data():
         """
         手动触发 tduck 数据同步
@@ -429,6 +536,7 @@ def create_app() -> Flask:
                         skip_count += 1
                         continue
 
+                    # 手动同步的数据也进入 pending_review 审核流程
                     post = Post(
                         title=filtered_data["title"],
                         content=filtered_data["content"],
@@ -440,7 +548,7 @@ def create_app() -> Flask:
                         submit_address=filtered_data.get("submit_address"),
                         submit_time=filtered_data.get("submit_time"),
                         tags=filtered_data.get("tags", []),
-                        status="pending",
+                        status="pending_review",  # 需要管理员审核
                         tduck_id=filtered_data.get("tduck_id"),
                         tduck_serial=filtered_data.get("tduck_serial"),
                         raw_data=filtered_data.get("raw_data"),
@@ -472,6 +580,7 @@ def create_app() -> Flask:
             return jsonify({"error": str(e)}), 500
 
     @app.route("/api/tduck/fields", methods=["GET"])
+    @require_auth
     def get_tduck_fields():
         """
         获取 tduck 表单字段定义
@@ -568,6 +677,7 @@ def create_app() -> Flask:
             return jsonify({"error": str(e)}), 500
 
     @app.route("/api/scheduler/status", methods=["GET"])
+    @require_auth
     def get_scheduler_status():
         """
         获取定时任务状态
@@ -585,6 +695,7 @@ def create_app() -> Flask:
             return jsonify({"error": str(e)}), 500
 
     @app.route("/api/scheduler/run", methods=["POST"])
+    @require_auth
     def run_sync_manually():
         """
         手动触发一次同步
@@ -603,6 +714,7 @@ def create_app() -> Flask:
             return jsonify({"error": str(e)}), 500
 
     @app.route("/api/posts/create", methods=["POST"])
+    @require_auth
     def create_post_manually():
         """
         手动创建投稿（用于测试）
@@ -648,6 +760,7 @@ def create_app() -> Flask:
 
             filtered_data = filtered_result["data"]
 
+            # 手动创建的投稿同样进入 pending_review（需要管理员审核通过才能同步）
             session = get_session()
             post = Post(
                 title=filtered_data["title"],
@@ -657,12 +770,12 @@ def create_app() -> Flask:
                 wx_nickname=filtered_data.get("wx_nickname"),
                 wx_openid=filtered_data.get("wx_openid"),
                 tags=filtered_data.get("tags", []),
-                status="pending",
+                status="pending_review",  # 待管理员审核
             )
             session.add(post)
             session.commit()
 
-            logger.info(f"手动创建投稿成功，ID: {post.id}")
+            logger.info(f"手动创建投稿成功（待审核），ID: {post.id}")
             return jsonify({
                 "status": "success",
                 "message": "投稿创建成功",
@@ -689,6 +802,39 @@ def create_app() -> Flask:
         if _session_factory is not None:
             _session_factory.remove()
 
+    # ===== 自动检测开发模式 =====
+    # 如果项目根目录存在 frontend/index.html，Flask 自动托管前端文件
+    # 方便本地调试（无需 Nginx），部署到服务器后有 Nginx 拦截 /，不会冲突
+    # 环境变量 DISABLE_DEV_FRONTEND=1 可强制关闭
+    frontend_dir = os.path.normpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frontend")
+    )
+    frontend_index = os.path.join(frontend_dir, "index.html")
+    disable_dev = os.environ.get("DISABLE_DEV_FRONTEND", "").strip() in ("1", "true", "yes")
+
+    if os.path.isfile(frontend_index) and not disable_dev:
+        logger.info(f"检测到前端文件，自动开启开发模式（目录: frontend/）")
+
+        @app.route("/")
+        def dev_index():
+            """返回前端首页 index.html"""
+            return send_from_directory(frontend_dir, "index.html")
+
+        @app.route("/css/<path:filename>")
+        def dev_css(filename):
+            """返回前端 CSS 文件"""
+            return send_from_directory(os.path.join(frontend_dir, "css"), filename)
+
+        @app.route("/js/<path:filename>")
+        def dev_js(filename):
+            """返回前端 JS 文件"""
+            return send_from_directory(os.path.join(frontend_dir, "js"), filename)
+
+        _dev_mode = True
+    else:
+        logger.info("未检测到前端文件或已被环境变量关闭，仅提供 API 服务")
+        _dev_mode = False
+
     return app
 
 
@@ -704,8 +850,19 @@ def main():
     from src.scheduler import start_scheduler
     start_scheduler()
 
+    frontend_dir = os.path.normpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frontend")
+    )
+    frontend_index = os.path.join(frontend_dir, "index.html")
+    disable_dev = os.environ.get("DISABLE_DEV_FRONTEND", "").strip() in ("1", "true", "yes")
+    _dev_mode = os.path.isfile(frontend_index) and not disable_dev
+
     print(f"[启动] 校园墙同步服务正在启动...")
     print(f"[启动] 监听地址: http://{host}:{port}")
+    print(f"[启动] 运行模式: {'开发（Flask 托管前端）' if _dev_mode else '生产（仅 API）'}")
+    if _dev_mode:
+        print(f"[启动] 前端页面: http://{host}:{port}")
+    print(f"[启动] 管理员密码: {config.admin.get('password', '未设置')}")
     print(f"[启动] tduck Webhook: http://{host}:{port}/webhook/tduck")
     print(f"[启动] 健康检查: http://{host}:{port}/health")
     print(f"[启动] 投稿列表: http://{host}:{port}/api/posts")

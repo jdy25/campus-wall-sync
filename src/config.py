@@ -121,6 +121,13 @@ class Config:
         """获取内容过滤配置"""
         return self._config_data.get("content_filter", {})
 
+    @property
+    def admin(self) -> Dict[str, Any]:
+        """获取管理员配置"""
+        return self._config_data.get("admin", {})
+
+
+
     @classmethod
     def reset(cls):
         """重置配置实例（用于测试）"""

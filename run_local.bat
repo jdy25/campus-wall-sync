@@ -1,57 +1,42 @@
-#!/bin/bash
-# ========================================
-# 本地开发启动脚本
-# 
-# 功能：自动安装依赖并启动服务
-# 使用：./run_local.sh
-# ========================================
 @echo off
-set -e  # 遇到错误立即退出
+chcp 65001 >nul
+REM ========================================
+REM  校园墙 - 本地开发启动脚本（Windows）
+REM  自动安装依赖并启动开发模式
+REM  使用：双击运行 或 run_local.bat
+REM ========================================
 
-echo "========================================"
-echo "  校园墙同步服务 - 本地开发启动脚本"
-echo "========================================"
+echo ========================================
+echo   校园墙 - 本地开发模式
+echo ========================================
 
-# 检查Python版本
-echo "[1/5] 检查Python版本..."
-python_version=$(python --version 2>&1 | cut -d' ' -f2 | cut -d'.' -f1)
-if [ "$python_version" -lt 3 ]; then
-    echo "错误: 需要Python 3.x，请先安装Python 3"
-    exit 1
-fi
-echo "  Python版本检查通过"
+REM 检查 Python
+python --version >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [错误] 未找到 Python，请先安装 Python 3
+    pause
+    exit /b 1
+)
 
-# 创建虚拟环境（可选）
-if [ ! -d "venv" ]; then
-    echo "[2/5] 创建虚拟环境..."
-    python -m venv venv
-    echo "  虚拟环境创建完成"
-else
-    echo "[2/5] 虚拟环境已存在，跳过创建"
-fi
+REM 安装依赖
+echo [1/2] 安装依赖...
+pip install -r requirements.txt -q
 
-# 激活虚拟环境
-echo "[3/5] 激活虚拟环境..."
-source venv/Scripts/activate  # Windows
-# source venv/bin/activate  # Linux/Mac
+REM 检查配置文件
+if not exist "config.json" (
+    echo [提示] config.json 不存在，从示例文件创建...
+    copy config.json.example config.json >nul
+    echo [请先编辑 config.json 填写配置]
+)
 
-# 安装依赖
-echo "[4/5] 安装项目依赖..."
-pip install --upgrade pip
-pip install -r requirements.txt
+REM 启动开发模式
+echo [2/2] 启动开发服务器...
+echo.
+echo ========================================
+echo   http://localhost:5000
+echo   密码: admin123
+echo ========================================
+echo.
+python run_dev.py
 
-# 检查配置文件
-echo "[5/5] 检查配置文件..."
-if [ ! -f "config.json" ]; then
-    echo "  警告: config.json 不存在，正在从示例文件创建..."
-    cp config.json.example config.json
-    echo "  请编辑 config.json 填写配置信息后再运行！"
-    exit 0
-fi
-
-# 启动服务
-echo ""
-echo "========================================"
-echo "  启动服务..."
-echo "========================================"
-python -m src.app
+pause
